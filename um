@@ -1,0 +1,267 @@
+#!/bin/bash
+
+set -euo pipefail
+
+OPTIND=1
+
+USER=""
+PASSWORD=""
+QUOTA=${QUOTA:-"300G"}
+BACKUP=0
+ALL=0
+DAYS=$((6 * 30))
+
+DO_CREATE=0
+DO_DELETE=0
+DO_PRUNE=0
+DO_LIST=0
+DO_INFO=0
+DO_INFO_SYS=0
+
+PREFIX=${PREFIX:-"bck"}
+
+
+print_help() {
+    echo "Usage: um COMMAND [OPTIONS]..."
+    echo "Manage system user to allocate Duplicati backups"
+    echo "  create         create a new user"
+    echo "    -h           display this help and exit"
+    echo "    -u ID        create a new user with system name ${PREFIX}-ID"
+    echo "    -p PASSWD    unhashed user password"
+    echo "    -q QUOTA     when creating new user assign the quota (default ${QUOTA})"
+    echo
+    echo "  delete         remove the user"
+    echo "    -h           display this help and exit"
+    echo "    -u ID        delete the user with system name ${PREFIX}-ID"
+    echo "    -b           copy all the backups into the attic (default no)"
+    echo
+    echo "  prune"
+    echo "    -h           display this help and exit"
+    echo "    -u ID        prune the user with system name ${PREFIX}-ID"
+    echo "    -a           prune all the users"
+    echo "    -d DAYS      remove backups older than days (default $DAYS)"
+    echo
+    echo "  list           list all the user"
+    echo "    -h           display this help and exit"
+    echo
+    echo "  info           generate a report from a user"
+    echo "    -h           display this help and exit"
+    echo "    -u ID        shows system name ${PREFIX}-ID information"
+    echo
+    echo "  info_sys       generate a report from the syste"
+    echo "    -h           display this help and exit"
+}
+
+die() {
+    echo -e "$1"
+    exit 1
+}
+
+system_user() {
+    local user="$1"
+    echo "${PREFIX}-${user}"
+}
+
+path_user() {
+    local user="$1"
+    echo "/home/$(system_user "${user}")"
+}
+
+list_users_path() {
+    ls -1d "$(path_user "")"* 2>/dev/null
+}
+
+list_users() {
+    local full_prefix
+    full_prefix="$(path_user "")"
+    for user in $(list_users_path); do
+	echo "${user#"${full_prefix}"}"
+    done
+}
+
+create_user() {
+    local user="$1"
+    local password="$2"
+    local quota="$3"
+    local sys_user
+    sys_user="$(system_user "${user}")"
+    [ -e "$(path_user "${user}")" ] && die "User ${user} already present"
+    sudo adduser -q --disabled-password --gecos "Backup for ${user}" "${sys_user}"
+    sudo chpasswd <<<"${sys_user}:${password}"
+    sudo setquota -u "${sys_user}" "${quota}" "${quota}" 0 0 /
+}
+
+delete_user() {
+    local user="$1"
+    local backup="$2"
+    local sys_user
+    sys_user="$(system_user "${user}")"
+    [ ! -e "$(path_user "${user}")" ] && die "User ${user} not found"
+    if [ "${backup}" = 1 ]; then
+	mkdir -p "${HOME}/attic/${user}"
+	sudo deluser -q --remove-home --backup-to "${HOME}/attic/${user}" "${sys_user}"
+    else
+	sudo deluser -q --remove-home "${sys_user}" 2>/dev/null
+    fi
+}
+
+prune_user() {
+    local user="$1"
+    local days="$2"
+    local pth_user
+    pth_user="$(path_user "${user}")"
+    [ ! -e "${pth_user}" ] && die "User ${user} not found"
+
+    # To avoid remove all backups, we will first calculate the total
+    # amount of backup files and compare it with the backup file to be
+    # pruned.  If they are the same, we do not remove anyone.
+    local total
+    total="$(sudo find "${pth_user}" -name 'duplicati-*' -type f | wc -l)"
+    local to_prune
+    to_prune="$(sudo find "${pth_user}" -name 'duplicati-*' -type f -mtime +"${days}" | wc -l)"
+    if [ "${total}" != "${to_prune}" ]; then
+	sudo find "${pth_user}" -name 'duplicati-*' -type f -mtime +"${days}" -delete
+    fi
+}
+
+last_backup_date() {
+    local user="$1"
+    local pth_user
+    pth_user="$(path_user "${user}")"
+    sudo find "${pth_user}" -name 'duplicati-*' -type f -printf "%T+\n" | sort -n -r | head -1 
+}
+
+over_quota() {
+    local user="$1"
+    local sys_user
+    sys_user="$(system_user "${user}")"
+    local out
+    out=$(sudo quota -q -u "${sys_user}")
+    if [ -z "${out}" ]; then
+	echo "No"
+    else
+	echo "Yes"
+    fi
+}
+
+info_user() {
+    local user="$1"
+    [ ! -e "$(path_user "${user}")" ] && die "User ${user} not found"
+    local last
+    last=$(last_backup_date "${user}")
+    echo "User: ${user}"
+    echo "Path: $(path_user "${user}")"
+    echo "Last-backup: ${last}"
+    echo "Over-quota: $(over_quota "${user}")"
+}
+
+info_system() {
+    echo "Total-users: $(list_users_path | wc -l)"
+    echo "Free: $(df -k --output=avail /home | tail -1)"
+    echo "Quota:"
+    sudo repquota --output=csv /
+}
+
+
+if [ $# = 0 ]; then
+    print_help
+    exit 1
+fi
+
+# Get the main command first
+case "$1" in
+    create|new|add)
+	DO_CREATE=1
+	;;
+    delete|del|remove|rm)
+	DO_DELETE=1
+	;;
+    prune|clean|cls|gc)
+	DO_PRUNE=1
+	;;
+    list|ls)
+	DO_LIST=1
+	;;
+    info|report)
+	DO_INFO=1
+	;;
+    info_sys|sys|system)
+	DO_INFO_SYS=1
+	;;
+    *)
+	print_help
+	exit 1
+esac
+shift
+
+# Parse the flags
+while getopts "h?u:p:q:bad:" opt; do
+    case "$opt" in
+	u)
+	    USER="${OPTARG}"
+	    ;;
+	p)
+	    PASSWORD="${OPTARG}"
+	    ;;
+	q)
+	    QUOTA="${OPTARG}"
+	    ;;
+	b)
+	    BACKUP=1
+	    ;;
+	a)
+	    ALL=1
+	    ;;
+	d)
+	    DAYS="${OPTARG}"
+	    ;;
+	h)
+	    print_help
+	    exit 0
+	    ;;
+	\?)
+	    print_help
+	    exit 1
+	    ;;
+    esac
+done
+
+if [ ${DO_CREATE} = 1 ]; then
+    [ -z "${USER}" ] && die "Use -u parameter to set the user ID"
+    [ -z "${PASSWORD}" ] && die "Use -p parameter to set the user password"
+    [ -z "${QUOTA}" ] && die "Use -q parameter to set the user quota"
+    create_user "${USER}" "${PASSWORD}" "${QUOTA}"
+fi
+
+if [ ${DO_DELETE} = 1 ]; then
+    [ -z "${USER}" ] && die "Use -u parameter to set the user ID"
+    delete_user "${USER}" "${BACKUP}"
+fi
+
+if [ ${DO_PRUNE} = 1 ]; then
+    [ -z "${USER}" ] && [ ${ALL} = 0 ] && die "Use -u or -a parameters to set the user ID"
+    [ -n "${USER}" ] && prune_user "${USER}" "${DAYS}"
+    if [ ${ALL} = 1 ]; then
+	for user in $(list_users); do
+	    prune_user "${user}" "${DAYS}"
+	done
+    fi
+fi
+
+if [ ${DO_LIST} = 1 ]; then
+    list_users | sort
+fi
+
+if [ ${DO_INFO} = 1 ]; then
+    [ -z "${USER}" ] && [ ${ALL} = 0 ] && die "Use -u or -a parameters to set the user ID"
+    [ -n "${USER}" ] && info_user "${USER}" "${DAYS}"
+    if [ ${ALL} = 1 ]; then
+	for user in $(list_users); do
+	    info_user "${user}" "${DAYS}"
+	done
+    fi
+fi
+
+if [ ${DO_INFO_SYS} = 1 ]; then
+    info_system
+fi

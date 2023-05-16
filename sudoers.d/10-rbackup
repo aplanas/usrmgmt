@@ -1,0 +1,4 @@
+# The user "rbackup" can execute certain commands as root
+Cmnd_Alias BACKUP = /usr/bin/find, /usr/bin/mv, /usr/bin/quota, /usr/sbin/adduser, /usr/sbin/chpasswd, /usr/sbin/deluser, /usr/sbin/repquota, /usr/sbin/setquota
+
+rbackup ALL=(ALL) NOPASSWD: BACKUP
